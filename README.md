@@ -14,7 +14,8 @@ parser.
 
 ## Covered subset
 
-- Float64 projection: `add`, `subtract`, `multiply`, and `divide`.
+- Float64 projection: `add`, `subtract`, `multiply`, `divide`, and fused
+  `multiply_add`.
 - Float64 predicates: `equal`, `not_equal`, `less_than`,
   `less_than_or_equal`, `greater_than`, and `greater_than_or_equal`, including
   DuckDB's NaN ordering.
@@ -90,14 +91,18 @@ allocator or release protocol is needed.
 Values and validity are separate contiguous buffers, like DuckDB's vector
 representation. Numeric values are row-major float64, keys and result indices
 are int64, and validity/selection vectors are uint8. Dense arithmetic and list
-metrics use native-width SIMD. Dense aggregates use vector reductions with a
-scalar remainder and parallelize above an internal threshold; nullable
+metrics use native-width SIMD. Large independent projection and compaction
+chunks use a bounded host worker pool above an internal threshold; smaller
+inputs stay serial. Dense aggregates use vector reductions with a scalar
+remainder; nullable
 aggregates retain stable online updates. Compact integer group ranges use
 direct indexing, with open addressing as the general fallback. Joins reuse
 their hash build across count and materialization, while a validated contiguous
 right-key range uses direct lookup.
 
-No GPU path is included.
+No GPU path is included: the covered kernels perform at most a few arithmetic
+operations per 8-byte value and are memory-bandwidth-bound, below the roughly
+2 FLOPs/byte level where transfer and launch costs could be justified.
 
 ## Benchmarks
 
@@ -111,13 +116,13 @@ Machine: Intel(R) Xeon(R) CPU E5-2697 v4 @ 2.30GHz; 72 logical CPUs; Linux
 
 | Kernel | Input | Mojo | DuckDB | DuckDB / Mojo | Result |
 |---|---:|---:|---:|---:|---|
-| fused numeric aggregates | 2,000,000 | 5.68 ms | 15.35 ms | 2.70x | faster |
-| projection a * b + a | 5,000,000 | 120.65 ms | 157.20 ms | 1.30x | faster |
-| filter/compact | 5,000,000 | 95.35 ms | 81.81 ms | 0.86x | slower |
-| integer group by (4,096 groups) | 1,000,000 | 7.88 ms | 19.05 ms | 2.42x | faster |
-| integer inner join (contiguous right keys) | 500,000 x 500,000 | 3.99 ms | 50.02 ms | 12.53x | faster |
+| fused numeric aggregates | 2,000,000 | 2.74 ms | 16.03 ms | 5.84x | faster |
+| fused projection a * b + a | 5,000,000 | 19.63 ms | 157.11 ms | 8.00x | faster |
+| filter/compact | 5,000,000 | 13.06 ms | 99.72 ms | 7.63x | faster |
+| integer group by (4,096 groups) | 1,000,000 | 8.21 ms | 19.38 ms | 2.36x | faster |
+| integer inner join (contiguous right keys) | 500,000 x 500,000 | 4.46 ms | 53.42 ms | 11.98x | faster |
 
-Mojo was faster in four of the five interface-level cases in this run. Dense
+Mojo was faster in all five interface-level cases in this run. Dense
 NumPy inputs remain zero-copy across the FFI boundary.
 
 ## Development

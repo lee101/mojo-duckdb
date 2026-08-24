@@ -30,6 +30,7 @@ from .kernels import (
     max,
     min,
     multiply,
+    multiply_add,
     not_equal,
     product,
     stddev,

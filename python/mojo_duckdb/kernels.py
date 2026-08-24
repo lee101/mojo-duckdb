@@ -2,13 +2,36 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import math
+import os
 from typing import Any, NamedTuple
 
 import numpy as np
 
 from ._lib import addr, lib
+
+
+_PARALLEL_THRESHOLD = 1_000_000
+_PARALLEL_WORKERS = min(8, os.cpu_count() or 1)
+_WORK_POOL = ThreadPoolExecutor(
+    max_workers=_PARALLEL_WORKERS, thread_name_prefix="mojo-duckdb"
+)
+
+
+def _ranges(size: int):
+    workers = _PARALLEL_WORKERS if size >= _PARALLEL_WORKERS else size
+    return tuple(
+        (worker * size // workers, (worker + 1) * size // workers)
+        for worker in range(workers)
+    )
+
+
+def _parallel_call(size: int, call) -> None:
+    futures = [_WORK_POOL.submit(call, begin, end) for begin, end in _ranges(size)]
+    for future in futures:
+        future.result()
 
 
 class AggregateResult(NamedTuple):
@@ -158,6 +181,33 @@ _COMPARE = {
 
 
 def _binary(a: Any, b: Any, op: str):
+    if not np.ma.isMaskedArray(a) and not np.ma.isMaskedArray(b):
+        raw_a = np.asarray(a)
+        raw_b = np.asarray(b)
+        if raw_a.dtype.kind != "O" and raw_b.dtype.kind != "O":
+            ba, bb = np.broadcast_arrays(raw_a, raw_b)
+            shape = ba.shape
+            av = _converted(ba, np.float64).reshape(-1)
+            bv = _converted(bb, np.float64).reshape(-1)
+            dst = np.empty(av.size, dtype=np.float64)
+            if av.size:
+                kernel = lib().mdb_binary
+                opcode = _BINARY[op]
+                if av.size >= _PARALLEL_THRESHOLD:
+                    def process(begin, end):
+                        kernel(
+                            addr(av[begin:]),
+                            addr(bv[begin:]),
+                            addr(dst[begin:]),
+                            end - begin,
+                            opcode,
+                        )
+
+                    _parallel_call(av.size, process)
+                else:
+                    kernel(addr(av), addr(bv), addr(dst), av.size, opcode)
+            result = dst.reshape(shape)
+            return result.item() if result.ndim == 0 else result
     av, bv, valid, shape = _pair(a, b)
     dst = np.empty(av.size, dtype=np.float64)
     if av.size:
@@ -179,6 +229,38 @@ def multiply(a: Any, b: Any):
 
 def divide(a: Any, b: Any):
     return _binary(a, b, "divide")
+
+
+def multiply_add(a: Any, b: Any, c: Any):
+    if not any(np.ma.isMaskedArray(value) for value in (a, b, c)):
+        raw_a = np.asarray(a)
+        raw_b = np.asarray(b)
+        raw_c = np.asarray(c)
+        if all(value.dtype.kind != "O" for value in (raw_a, raw_b, raw_c)):
+            ba, bb, bc = np.broadcast_arrays(raw_a, raw_b, raw_c)
+            shape = ba.shape
+            av = _converted(ba, np.float64).reshape(-1)
+            bv = _converted(bb, np.float64).reshape(-1)
+            cv = _converted(bc, np.float64).reshape(-1)
+            dst = np.empty(av.size, dtype=np.float64)
+            if av.size:
+                kernel = lib().mdb_multiply_add
+                if av.size >= _PARALLEL_THRESHOLD:
+                    def process(begin, end):
+                        kernel(
+                            addr(av[begin:]),
+                            addr(bv[begin:]),
+                            addr(cv[begin:]),
+                            addr(dst[begin:]),
+                            end - begin,
+                        )
+
+                    _parallel_call(av.size, process)
+                else:
+                    kernel(addr(av), addr(bv), addr(cv), addr(dst), av.size)
+            result = dst.reshape(shape)
+            return result.item() if result.ndim == 0 else result
+    return add(multiply(a, b), c)
 
 
 def _compare(a: Any, b: Any, op: str):
@@ -328,6 +410,52 @@ def corr(a: Any, b: Any) -> float | None:
 
 
 def filter(values: Any, predicate: Any):
+    dense_data = _dense_column(values)
+    dense_predicate = _dense_column(predicate, np.bool_)
+    if dense_data is not None and dense_predicate is not None:
+        if dense_data.size != dense_predicate.size:
+            raise ValueError("values and predicate must have the same length")
+        dst = np.empty(dense_data.size, dtype=np.float64)
+        if dense_data.size == 0:
+            return dst
+        kernel = lib().mdb_compact_dense
+        if dense_data.size >= _PARALLEL_THRESHOLD:
+            ranges = _ranges(dense_data.size)
+            counts = tuple(
+                int(np.count_nonzero(dense_predicate[begin:end]))
+                for begin, end in ranges
+            )
+            offsets = []
+            n = 0
+            for count in counts:
+                offsets.append(n)
+                n += count
+
+            def process(partition):
+                begin, end = ranges[partition]
+                destination = offsets[partition]
+                if counts[partition]:
+                    kernel(
+                        addr(dense_data[begin:]),
+                        addr(dense_predicate[begin:]),
+                        addr(dst[destination:]),
+                        end - begin,
+                    )
+
+            futures = [
+                _WORK_POOL.submit(process, partition)
+                for partition in range(len(ranges))
+            ]
+            for future in futures:
+                future.result()
+        else:
+            n = kernel(
+                addr(dense_data),
+                addr(dense_predicate),
+                addr(dst),
+                dense_data.size,
+            )
+        return dst[:n]
     data, valid = _column(values)
     pred, pred_valid = _column(predicate)
     if data.size != pred.size:
@@ -340,7 +468,12 @@ def filter(values: Any, predicate: Any):
     if data.size == 0:
         return dst
     n = lib().mdb_compact(
-        addr(data), addr(valid), addr(selected), addr(dst), addr(dst_valid), data.size
+        addr(data),
+        addr(valid),
+        addr(selected),
+        addr(dst),
+        addr(dst_valid),
+        data.size,
     )
     return _nullable(dst[:n], dst_valid[:n], (n,))
 

@@ -202,6 +202,34 @@ def test_projection_supports_scalar_broadcast():
     assert mdb.equal(None, 4.0) is None
 
 
+@pytest.mark.parametrize("size", range(18))
+def test_multiply_add_simd_tail_and_broadcast(size):
+    a = np.arange(size, dtype=np.float64) + 0.25
+    b = np.arange(size, dtype=np.float64) + 1.5
+    assert mdb.multiply_add(a, b, 2.0) == pytest.approx(a * b + 2.0)
+
+
+def test_multiply_add_nullable_matches_duckdb():
+    a = [1.0, None, 3.0]
+    b = [2.0, 4.0, None]
+    c = [5.0, 6.0, 7.0]
+    expected = CON.execute(
+        "select a * b + c from (select unnest(?) a, unnest(?) b, unnest(?) c)",
+        [a, b, c],
+    ).fetchnumpy()["((a * b) + c)"]
+    assert normalized(mdb.multiply_add(a, b, c)) == normalized(expected)
+
+
+def test_parallel_projection_and_filter_threshold_paths():
+    size = 1_000_003
+    a = np.arange(size, dtype=np.float64) * 0.25
+    b = np.full(size, 2.0)
+    predicate = np.arange(size) % 7 == 0
+    assert np.array_equal(mdb.add(a, b), a + b)
+    assert mdb.multiply_add(a, b, 1.0) == pytest.approx(a * b + 1.0)
+    assert np.array_equal(mdb.filter(a, predicate), a[predicate])
+
+
 @pytest.mark.parametrize(
     ("name", "operator"),
     [

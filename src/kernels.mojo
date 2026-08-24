@@ -23,36 +23,53 @@ def bptr(addr: Int) -> BPtr:
     return BPtr(unsafe_from_address=addr)
 
 
-def binary(a: FPtr, b: FPtr, dst: FPtr, n: Int, op: Int):
-    var i = 0
+def binary_chunk(a: FPtr, b: FPtr, dst: FPtr, begin: Int, end: Int, op: Int):
+    var i = begin
     if op == 0:
-        while i + W <= n:
+        while i + W <= end:
             dst.store(i, a.load[width=W](i) + b.load[width=W](i))
             i += W
-        while i < n:
+        while i < end:
             dst[i] = a[i] + b[i]
             i += 1
     elif op == 1:
-        while i + W <= n:
+        while i + W <= end:
             dst.store(i, a.load[width=W](i) - b.load[width=W](i))
             i += W
-        while i < n:
+        while i < end:
             dst[i] = a[i] - b[i]
             i += 1
     elif op == 2:
-        while i + W <= n:
+        while i + W <= end:
             dst.store(i, a.load[width=W](i) * b.load[width=W](i))
             i += W
-        while i < n:
+        while i < end:
             dst[i] = a[i] * b[i]
             i += 1
     else:
-        while i + W <= n:
+        while i + W <= end:
             dst.store(i, a.load[width=W](i) / b.load[width=W](i))
             i += W
-        while i < n:
+        while i < end:
             dst[i] = a[i] / b[i]
             i += 1
+
+
+def binary(a: FPtr, b: FPtr, dst: FPtr, n: Int, op: Int):
+    binary_chunk(a, b, dst, 0, n, op)
+
+
+def multiply_add(a: FPtr, b: FPtr, c: FPtr, dst: FPtr, n: Int):
+    var i = 0
+    while i + W <= n:
+        dst.store(
+            i,
+            a.load[width=W](i) * b.load[width=W](i) + c.load[width=W](i),
+        )
+        i += W
+    while i < n:
+        dst[i] = a[i] * b[i] + c[i]
+        i += 1
 
 
 def compare(a: FPtr, b: FPtr, dst: BPtr, n: Int, op: Int):
@@ -244,6 +261,77 @@ def bivariate(a: FPtr, b: FPtr, av: BPtr, bv: BPtr, n: Int, dst: FPtr):
     dst[3] = m2b
 
 
+def compact_range(
+    values: FPtr,
+    valid: BPtr,
+    predicate: BPtr,
+    dst: FPtr,
+    dst_valid: BPtr,
+    begin: Int,
+    end: Int,
+    destination: Int,
+) -> Int:
+    var written = destination
+    var i = begin
+    while i + W <= end:
+        var batch = values.load[width=W](i)
+        var batch_valid = valid.load[width=W](i)
+        var selected = predicate.load[width=W](i).ne(0)
+        comptime for lane in range(W):
+            if selected[lane]:
+                dst[written] = batch[lane]
+                dst_valid[written] = batch_valid[lane]
+                written += 1
+        i += W
+    while i < end:
+        if predicate[i] != 0:
+            dst[written] = values[i]
+            dst_valid[written] = valid[i]
+            written += 1
+        i += 1
+    return written
+
+
+def compact_dense_range(
+    values: FPtr,
+    predicate: BPtr,
+    dst: FPtr,
+    begin: Int,
+    end: Int,
+    destination: Int,
+) -> Int:
+    var written = destination
+    var i = begin
+    while i + W <= end:
+        var batch = values.load[width=W](i)
+        var selected = predicate.load[width=W](i).ne(0)
+        comptime for lane in range(W):
+            if selected[lane]:
+                dst[written] = batch[lane]
+                written += 1
+        i += W
+    while i < end:
+        if predicate[i] != 0:
+            dst[written] = values[i]
+            written += 1
+        i += 1
+    return written
+
+
+def count_selected(predicate: BPtr, begin: Int, end: Int) -> Int:
+    var count = 0
+    var i = begin
+    while i + W <= end:
+        var selected = predicate.load[width=W](i).ne(0)
+        comptime for lane in range(W):
+            count += Int(selected[lane])
+        i += W
+    while i < end:
+        count += Int(predicate[i] != 0)
+        i += 1
+    return count
+
+
 def compact(
     values: FPtr,
     valid: BPtr,
@@ -252,13 +340,13 @@ def compact(
     dst_valid: BPtr,
     n: Int,
 ) -> Int:
-    var written = 0
-    for i in range(n):
-        if predicate[i] != 0:
-            dst[written] = values[i]
-            dst_valid[written] = valid[i]
-            written += 1
-    return written
+    return compact_range(values, valid, predicate, dst, dst_valid, 0, n, 0)
+
+
+def compact_dense(
+    values: FPtr, predicate: BPtr, dst: FPtr, n: Int
+) -> Int:
+    return compact_dense_range(values, predicate, dst, 0, n, 0)
 
 
 def list_metric(a: FPtr, b: FPtr, dst: FPtr, rows: Int, width: Int, op: Int):
@@ -511,6 +599,13 @@ def mdb_binary(a: Int, b: Int, dst: Int, n: Int, op: Int) abi("C"):
     binary(fptr(a), fptr(b), fptr(dst), n, op)
 
 
+@export("mdb_multiply_add")
+def mdb_multiply_add(
+    a: Int, b: Int, c: Int, dst: Int, n: Int
+) abi("C"):
+    multiply_add(fptr(a), fptr(b), fptr(c), fptr(dst), n)
+
+
 @export("mdb_compare")
 def mdb_compare(a: Int, b: Int, dst: Int, n: Int, op: Int) abi("C"):
     compare(fptr(a), fptr(b), bptr(dst), n, op)
@@ -537,11 +632,28 @@ def mdb_bivariate(
 
 @export("mdb_compact")
 def mdb_compact(
-    values: Int, valid: Int, predicate: Int, dst: Int, dst_valid: Int, n: Int
+    values: Int,
+    valid: Int,
+    predicate: Int,
+    dst: Int,
+    dst_valid: Int,
+    n: Int,
 ) abi("C") -> Int:
     return compact(
-        fptr(values), bptr(valid), bptr(predicate), fptr(dst), bptr(dst_valid), n
+        fptr(values),
+        bptr(valid),
+        bptr(predicate),
+        fptr(dst),
+        bptr(dst_valid),
+        n,
     )
+
+
+@export("mdb_compact_dense")
+def mdb_compact_dense(
+    values: Int, predicate: Int, dst: Int, n: Int
+) abi("C") -> Int:
+    return compact_dense(fptr(values), bptr(predicate), fptr(dst), n)
 
 
 @export("mdb_list_metric")

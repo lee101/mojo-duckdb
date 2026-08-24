@@ -16,11 +16,13 @@ I = ctypes.c_int64
 
 _SIGNATURES = {
     "mdb_binary": ([I, I, I, I, I], None),
+    "mdb_multiply_add": ([I, I, I, I, I], None),
     "mdb_compare": ([I, I, I, I, I], None),
     "mdb_aggregate": ([I, I, I, I], None),
     "mdb_aggregate_dense": ([I, I, I, I], None),
     "mdb_bivariate": ([I, I, I, I, I, I], None),
-    "mdb_compact": ([I, I, I, I, I, I], I),
+    "mdb_compact": ([I] * 6, I),
+    "mdb_compact_dense": ([I] * 4, I),
     "mdb_list_metric": ([I, I, I, I, I, I], None),
     "mdb_group_i64": ([I] * 13, I),
     "mdb_group_dense_i64": ([I] * 10, I),

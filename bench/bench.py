@@ -66,9 +66,9 @@ def main() -> None:
     con.register("projection_data", {"a": projection_a, "b": projection_b})
     cases.append(
         (
-            "projection a * b + a",
+            "fused projection a * b + a",
             "5,000,000",
-            lambda: mdb.add(mdb.multiply(projection_a, projection_b), projection_a),
+            lambda: mdb.multiply_add(projection_a, projection_b, projection_a),
             lambda: con.execute("select a * b + a as x from projection_data").fetchnumpy()[
                 "x"
             ],
