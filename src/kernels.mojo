@@ -1,6 +1,5 @@
 """Vector execution kernels for the Python C ABI."""
 
-from std.algorithm import sync_parallelize
 from std.math import sqrt
 from std.sys import simd_width_of
 
@@ -190,15 +189,12 @@ def aggregate_dense(values: FPtr, n: Int, dst: FPtr, scratch: FPtr):
         aggregate_dense_chunk(values, 0, n, dst)
         return
 
-    @parameter
-    def aggregate_partition(partition: Int):
+    for partition in range(AGGREGATE_WORKERS):
         var begin = partition * n // AGGREGATE_WORKERS
         var end = (partition + 1) * n // AGGREGATE_WORKERS
         aggregate_dense_chunk(
             values, begin, end, scratch + partition * 7
         )
-
-    sync_parallelize[aggregate_partition](AGGREGATE_WORKERS)
 
     for j in range(7):
         dst[j] = scratch[j]
